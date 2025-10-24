@@ -10,7 +10,7 @@
 // --- Type Aliases ---
 // We get these from "fft_types.h"
 
-#define DEBUG_MRFFT
+// #define DEBUG_MRFFT // <--- 保持注释掉的状态
 
 /**
  * @brief Performs an in-place mixed-radix DIT FFT.
@@ -36,8 +36,7 @@ void mixedRadixFFT(CVector &data, const std::vector<int> &radices)
 
     // ------------------------------------
     // PHASE 1: Permutation
-    // Use reversed radices for the permutation so it lines up with the DIT stage order
-    // we apply below (we run stages using reversed radices).
+    // Use reversed radices for the DIT permutation
     std::vector<int> rad_rev = radices;
     std::reverse(rad_rev.begin(), rad_rev.end());
     std::vector<int> scatter_table = generatePermutationTable(N, rad_rev);
@@ -63,8 +62,7 @@ void mixedRadixFFT(CVector &data, const std::vector<int> &radices)
 
     // ------------------------------------
     // PHASE 2: Computation (m stages)
-    // We'll run the stage loop via a small helper so we can try different radices orderings
-    // for debugging (original vs reversed).
+    // This implements the DIT (Cooley-Tukey) butterfly structure
     auto run_stages = [&](CVector &work, const std::vector<int> &rads, const std::string &label, std::vector<CVector> *snapshots = nullptr)
     {
         int span_local = 1;
@@ -80,11 +78,18 @@ void mixedRadixFFT(CVector &data, const std::vector<int> &radices)
             {
                 for (int k = 0; k < span_local; ++k)
                 {
-                    // Load
+                    // --- CORRECT DIT BUTTERFLY ---
+                    // 1. Load AND apply twiddle factors
                     for (int j = 0; j < r; ++j)
-                        temp[j] = work[b * block_size + k + j * span_local];
+                    {
+                        // Twiddle factor is W_blocksize^(j*k)
+                        // (Note: no twiddles on first stage since span_local=1 -> k=0)
+                        double angle = -2.0 * PI * (double)(j * k) / (double)block_size;
+                        Complex twiddle = std::exp(Complex(0, angle));
+                        temp[j] = work[b * block_size + k + j * span_local] * twiddle;
+                    }
 
-                    // local r-point DFT
+                    // 2. local r-point DFT
                     if (r == 2)
                     {
                         dft_out[0] = temp[0] + temp[1];
@@ -108,22 +113,20 @@ void mixedRadixFFT(CVector &data, const std::vector<int> &radices)
 #ifdef DEBUG_MRFFT
                     std::cerr << "[DEBUG_MRFFT:" << label << "] stage=" << s_local << " block=" << b << " k=" << k << " r=" << r << "\n";
                     for (int jj = 0; jj < r; ++jj)
-                        std::cerr << "  temp[" << jj << "] = " << temp[jj] << "\n";
+                        std::cerr << "  temp(twiddled)[" << jj << "] = " << temp[jj] << "\n";
                     for (int jj = 0; jj < r; ++jj)
                         std::cerr << "  dft_out[" << jj << "] = " << dft_out[jj] << "\n";
 #endif
 
+                    // 3. Store (without twiddle)
                     for (int j = 0; j < r; ++j)
                     {
-                        // Use full transform length N in denominator
-                        double angle = -2.0 * PI * (double)(j * (b * span_local + k)) / (double)N;
-                        Complex twiddle = std::exp(Complex(0, angle));
 #ifdef DEBUG_MRFFT
-                        std::cerr << "    j=" << j << " twiddle(angle)=" << angle << " twiddle=" << twiddle << "\n";
-                        std::cerr << "    write idx=" << (b * block_size + k + j * span_local) << " = " << dft_out[j] * twiddle << "\n";
+                        std::cerr << "    write idx=" << (b * block_size + k + j * span_local) << " = " << dft_out[j] << "\n";
 #endif
-                        work[b * block_size + k + j * span_local] = dft_out[j] * twiddle;
+                        work[b * block_size + k + j * span_local] = dft_out[j];
                     }
+                    // --- END CORRECT DIT BUTTERFLY ---
                 }
             }
 
@@ -134,40 +137,57 @@ void mixedRadixFFT(CVector &data, const std::vector<int> &radices)
                 std::cerr << " [" << i << "] = " << work[i] << "\n";
             if (work.size() > limit)
                 std::cerr << " ... (truncated)\n";
+            // if (snapshots) // <-- 此行已从 DEBUG 块中移出
+            //     snapshots->push_back(work);
+#endif
+
+            // ==========================================================
+            // <<<<< FIX IS HERE >>>>
+            // 这一行必须在 #ifdef 之外，
+            // 否则当 DEBUG_MRFFT 未定义时，N=6 的比较会崩溃
             if (snapshots)
                 snapshots->push_back(work);
-#endif
+            // ==========================================================
 
             span_local = block_size;
         }
     };
 
-    // Helper to compute expected snapshots for N=6 using math (twiddle denom = N)
-    auto compute_expected_snapshots_N6 = [&](const CVector &perm_data, const std::vector<int> &rads_rev)
+    // Helper to compute expected snapshots for N=6 using math
+    // This function must ALSO follow the correct DIT logic
+    auto compute_expected_snapshots_N6 = [&](const CVector &perm_data, const std::vector<int> &rads_order)
     {
         const int Nlocal = 6;
         std::vector<CVector> expect;
+        CVector s_prev = perm_data;
+        int span_prev = 1;
+
         // Stage 0
-        CVector s0 = perm_data;
-        int r0 = rads_rev[0];
-        int span0 = 1;
-        int block0 = span0 * r0;
-        for (int b = 0; b < Nlocal / block0; ++b)
+        CVector s0 = s_prev;
+        int r0 = rads_order[0];                   // 2
+        int span0 = span_prev;                    // 1
+        int block0 = span0 * r0;                  // 2
+        for (int b = 0; b < Nlocal / block0; ++b) // b=0, 1, 2
         {
-            for (int k = 0; k < span0; ++k)
+            for (int k = 0; k < span0; ++k) // k=0
             {
                 CVector temp(r0);
                 for (int j = 0; j < r0; ++j)
-                    temp[j] = s0[b * block0 + k + j * span0];
+                {
+                    // k=0, so angle=0, twiddle=1
+                    double angle = -2.0 * PI * (double)(j * k) / (double)block0;
+                    Complex tw = std::exp(Complex(0, angle));
+                    temp[j] = s0[b * block0 + k + j * span0] * tw;
+                }
+
+                // Local DFT
+                CVector dft_out(r0);
+                dft_out[0] = temp[0] + temp[1];
+                dft_out[1] = temp[0] - temp[1];
+
                 for (int j_out = 0; j_out < r0; ++j_out)
                 {
-                    Complex sum = 0.0;
-                    for (int j_in = 0; j_in < r0; ++j_in)
-                    {
-                        double angle = -2.0 * PI * (double)(j_out * j_in) / (double)r0;
-                        sum += temp[j_in] * std::exp(Complex(0, angle));
-                    }
-                    s0[b * block0 + k + j_out * span0] = sum;
+                    s0[b * block0 + k + j_out * span0] = dft_out[j_out];
                 }
             }
         }
@@ -175,16 +195,25 @@ void mixedRadixFFT(CVector &data, const std::vector<int> &radices)
 
         // Stage 1
         CVector s1 = s0;
-        int r1 = rads_rev[1];
-        int span1 = block0;
-        int block1 = span1 * r1;
-        for (int b = 0; b < Nlocal / block1; ++b)
+        int r1 = rads_order[1];                   // 3
+        int span1 = block0;                       // 2
+        int block1 = span1 * r1;                  // 6
+        for (int b = 0; b < Nlocal / block1; ++b) // b=0
         {
-            for (int k = 0; k < span1; ++k)
+            for (int k = 0; k < span1; ++k) // k=0, 1
             {
                 CVector temp(r1);
                 for (int j = 0; j < r1; ++j)
-                    temp[j] = s1[b * block1 + k + j * span1];
+                {
+                    // k=0: twiddle=1
+                    // k=1: twiddle=W_6^(j*1)
+                    double angle = -2.0 * PI * (double)(j * k) / (double)block1;
+                    Complex tw = std::exp(Complex(0, angle));
+                    temp[j] = s1[b * block1 + k + j * span1] * tw;
+                }
+
+                // Local DFT
+                CVector dft_out(r1);
                 for (int j_out = 0; j_out < r1; ++j_out)
                 {
                     Complex sum = 0.0;
@@ -193,9 +222,12 @@ void mixedRadixFFT(CVector &data, const std::vector<int> &radices)
                         double angle = -2.0 * PI * (double)(j_out * j_in) / (double)r1;
                         sum += temp[j_in] * std::exp(Complex(0, angle));
                     }
-                    double tw_angle = -2.0 * PI * (double)(j_out * (b * span1 + k)) / (double)Nlocal;
-                    Complex tw = std::exp(Complex(0, tw_angle));
-                    s1[b * block1 + k + j_out * span1] = sum * tw;
+                    dft_out[j_out] = sum;
+                }
+
+                for (int j_out = 0; j_out < r1; ++j_out)
+                {
+                    s1[b * block1 + k + j_out * span1] = dft_out[j_out];
                 }
             }
         }
@@ -203,49 +235,55 @@ void mixedRadixFFT(CVector &data, const std::vector<int> &radices)
         return expect;
     };
 
-    // The correct DIT mixed-radix sequence is: permute, then run stages with radices
-    // in reversed order relative to the digit-reversal construction. Use reversed radices.
-    // rad_rev was computed above for the permutation; reuse it here.
+    // The correct DIT mixed-radix sequence is: permute (using reversed radices),
+    // then run stages using *original* radices.
     std::vector<CVector> snapshots;
     if (N == 6)
     {
         // copy permuted input for expected calculation
         CVector permuted_input = data;
-        run_stages(data, rad_rev, "rev", &snapshots);
-        auto expected = compute_expected_snapshots_N6(permuted_input, rad_rev);
+
+        // Run stages with original radices {2, 3}
+        run_stages(data, radices, "orig", &snapshots);
+
+        // Hardcoded check must also use original radices {2, 3}
+        auto expected = compute_expected_snapshots_N6(permuted_input, radices);
+
         for (size_t s = 0; s < expected.size(); ++s)
         {
+#ifdef DEBUG_MRFFT
             std::cerr << "[DEBUG_MRFFT] Stage " << s << " comparison:\n";
+#endif
+            double max_stage_err = 0.0;
             for (int i = 0; i < N; ++i)
             {
                 Complex actual = snapshots[s][i];
                 Complex expv = expected[s][i];
                 double err = std::abs(actual - expv);
+                if (err > max_stage_err)
+                    max_stage_err = err;
+#ifdef DEBUG_MRFFT
                 if (err > 1e-9)
                     std::cerr << " idx=" << i << " actual=" << actual << " expected=" << expv << " err=" << err << "\n";
+#endif
             }
+#ifdef DEBUG_MRFFT
+            std::cerr << "[DEBUG_MRFFT] Stage " << s << " max error: " << max_stage_err << "\n";
+#endif
         }
     }
     else
     {
-        run_stages(data, rad_rev, "rev");
+        run_stages(data, radices, "orig");
     }
 
 #ifdef DEBUG_MRFFT
     // Diagnostic: compute naive DFT of the original *input* (before permutation)
-    // To compare correctly, we need the original input. Since we permuted in-place at the start,
-    // regenerate the original ordering by applying the scatter_table (inverse of gather_table).
-    // scatter_table maps old_index -> new_index (original -> permuted). We saved scatter_table earlier,
-    // so reconstruct original input by undoing reorderInPlace: create copy and scatter back.
-
-    // Use the original saved input (x_before_perm) to compute the reference DFT
-    // (x_before_perm was saved at the start of this function before any permutation).
     CVector x_orig = CVector(x_before_perm.begin(), x_before_perm.end());
     std::vector<Complex> X_ref = dft_naive(x_orig);
 
     // Our algorithm produced data in-place; after full mixedRadixFFT the 'data' vector
-    // should equal X_ref (up to numerical error) but note: depending on permutation convention,
-    // the output ordering might differ. We check for equality in the straightforward output order.
+    // should equal X_ref
     double max_err = 0.0;
     int bad_idx = -1;
     for (int i = 0; i < N; ++i)
@@ -270,7 +308,6 @@ void mixedRadixFFT(CVector &data, const std::vector<int> &radices)
     }
 
     // Additional diagnostics: compute DFT of the permuted input (x_perm_diag)
-    // and compute nearest-neighbor mapping from computed outputs to naive DFT indices.
     std::vector<Complex> x_perm_diag(N);
     // scatter_table maps original_index -> permuted_index
     for (int orig = 0; orig < N; ++orig)

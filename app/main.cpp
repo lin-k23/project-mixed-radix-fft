@@ -75,11 +75,13 @@ int main()
     std::srand(42); // Seed for reproducible results
 
     // runTest("Radix-2 (N=8)", {2, 2, 2});
-    runTest("Mixed-Radix (N=6)", {2, 3});
+    // runTest("Mixed-Radix (N=6)", {2, 3});
     // runTest("Mixed-Radix (N=12)", {2, 2, 3});
     // runTest("Mixed-Radix (N=15)", {3, 5});
     // runTest("Radix-3 (N=9)", {3, 3});
     // runTest("Mixed-Radix (N=18)", {2, 3, 3});
+    // runTest("Mixed-Radix (N=30)", {2, 3, 5});
+    runTest("Mixed-Radix (N=60)", {2, 2, 3, 5});
 
     return 0;
 }
